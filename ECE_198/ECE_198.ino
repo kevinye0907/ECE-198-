@@ -1,463 +1,360 @@
-/*
- * ECE 198: Group 36 Sleep Monitor Project
- * Hardware: Arduino UNO R4 WiFi + Pulse Oximeter (MAX30102/MAX30100)
- * 
- * Logic Sources:
- * - Sleep detection based on HR thresholds (55/65 BPM) 
- * - Updates status every minute based on average HR 
- * - Sends alert when irregular heart rate pattern is detected
- */
-
-#include <WiFiS3.h>
+#include <DFRobot_MAX30102.h>
 #include <Wire.h>
-#include "MAX30105.h"
-#include "heartRate.h"
+#include <WiFiS3.h>    
+#include <Arduino.h>
 
-// --- WiFi Credentials ---
-const char* ssid = "YOUR_WIFI_SSID";        
-const char* password = "YOUR_WIFI_PASSWORD"; 
+// Credentials for Hospital
+// ==== WiFi credentials ====
+const char* WIFI_SSID     = "YOUR_WIFI_SSID";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 
-// --- Email Configuration ---
-const char* emailSender = "michaelshi095@gmail.com";
-const char* emailRecipient = "caregiver@example.com"; 
-const char* smtpServer = "mail.smtp2go.com";  
-const int smtpPort = 2525;
+// ==== SMTP server settings (ask hospital IT or use a provider that supports basic auth on 465) ====
+const char* SMTP_HOST = "smtp.hospital-domain.org"; // e.g., "smtp.office365.com" (if they allow app passwords) or hospital relay
+const uint16_t SMTP_PORT = 465;                     // Implicit SSL
 
-// --- Global Variables & Constants ---
-MAX30105 particleSensor;
+// ==== SMTP login (username/password auth) ====
+const char* SMTP_USER = "device-mailbox@hospital-domain.org";
+const char* SMTP_PASS = "YOUR_SMTP_PASSWORD";
 
-const int THRESHOLD_SLEEP_START = 55;
-const int THRESHOLD_SLEEP_END = 65;
+// ==== Email addresses ====
+const char* FROM_EMAIL  = "device-mailbox@hospital-domain.org";
+const char* FROM_NAME   = "Patient Sleep Monitor";
+const char* TO_EMAIL    = "nurses.station@hospital-domain.org";
 
-const unsigned long UPDATE_INTERVAL = 60000;     
+//////
 
-unsigned long lastUpdateTimer = 0;
-unsigned long projectStartTime = 0;
 
-// Heart Rate Detection Variables
-const byte RATE_SIZE = 4;
-byte rates[RATE_SIZE];
-byte rateSpot = 0;
-long lastBeat = 0;
-
-// Data Averaging Variables
-long hrSum = 0;
-int hrSampleCount = 0;
-int lastValidBPM = 0;
-
-// Heart Rate Pattern Tracking for Irregularity Detection
-const int HR_HISTORY_SIZE = 10;  
-int hrHistory[HR_HISTORY_SIZE];
-int hrHistoryIndex = 0;
-int hrHistoryCount = 0;
-bool lastAlertSent = false;
-
-// Sleep State Tracking
-bool isSleeping = false;
-float currentSleepStart = 0;
-
-// Data Storage
-struct SleepPeriod {
-  float startTime;
-  float duration;
+//object storing variables for one sleep period
+struct SleepLog {
+  unsigned long start;     // milliseconds since the sleeping began
+  unsigned long duration;  // duration in milliseconds
 };
 
-SleepPeriod sleepHistory[50];
-int sleepIndex = 0;
+//constants
+const int MAX_LOGS = 24;                      //capacity of sleeplog array which stores the different sleep periods
+const int LOW_HR_THRESHOLD = 55;              //lower heart rate threshold (sleeping)
+const int HIGH_HR_THRESHOLD = 65;             //above this = awake
+const unsigned long MIN_SLEEP_TIME_MS = 30UL * 60UL * 1000UL;  // 1 hour
+
+//Global Variables
+DFRobot_MAX30102 particleSensor; // Allows us to call methods
+SleepLog logs[MAX_LOGS];   // array that stores the different sleep periods
+int logCount = 0;          // number of sleep periods that have been recorded
+float totalSleepMin = 0;   // total sleep minutes for 1 day
+
+//Oxiometer Variables
+int32_t SPO2;           // oxygen saturation as a percent
+int8_t SPO2Valid;       // tells you whether oxygen saturation is valid
+int32_t heartRate;      // heart rate (BPM)
+int8_t heartRateValid;  // tells you whether heart rate is valid
+
+bool sleeping = false;     // current sleep state
+unsigned long sleepStartTime = 0; // start time of sleep period since program execution
+
 
 void setup() {
-  Serial.begin(115200);
-  delay(2000);
-  
-  Serial.println("=== Sleep Monitor Starting ===");
+  Serial.begin(9600);
+  connectWiFi();                    // move after Serial.begin()
 
-  // Initialize Sensor
-  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
-    Serial.println("ERROR: MAX30105 not found. Check wiring!");
-    while (1);
-  }
-  
-  Serial.println("Sensor initialized successfully");
-  
-  // Configure sensor for heart rate detection
-  particleSensor.setup();
-  particleSensor.setPulseAmplitudeRed(0x0A);
-  particleSensor.setPulseAmplitudeGreen(0);
+  Wire.begin(); // I2C
 
-  // Initialize WiFi
-  connectToWiFi();
-
-  projectStartTime = millis();
-  lastUpdateTimer = millis();
-  
-  Serial.println("Setup complete. Monitoring heart rate...");
-}
-
-void loop() {
-  // Continuously read sensor data
-  long irValue = particleSensor.getIR();
-  
-  // Check if finger is on sensor (IR value above threshold)
-  if (irValue > 50000) {
-    
-    // Detect heartbeat using the library function
-    if (checkForBeat(irValue) == true) {
-      // Calculate time between beats
-      long delta = millis() - lastBeat;
-      lastBeat = millis();
-
-      // Calculate BPM from time between beats
-      int beatsPerMinute = 60 / (delta / 1000.0);
-
-      // Filter out unrealistic values (sensor noise/errors)
-      if (beatsPerMinute > 30 && beatsPerMinute < 220) {
-        // Store in circular buffer for averaging
-        rates[rateSpot++] = (byte)beatsPerMinute;
-        rateSpot %= RATE_SIZE;
-
-        // Calculate average of last few readings
-        int beatAvg = 0;
-        for (byte x = 0; x < RATE_SIZE; x++) {
-          beatAvg += rates[x];
-        }
-        beatAvg /= RATE_SIZE;
-
-        // Add to minute accumulator
-        hrSum += beatAvg;
-        hrSampleCount++;
-        lastValidBPM = beatAvg;
-
-        // Optional: Print current reading
-        Serial.print("BPM: ");
-        Serial.print(beatsPerMinute);
-        Serial.print(" | Avg: ");
-        Serial.println(beatAvg);
-      }
-    }
-  } else {
-    Serial.println("No finger detected. Place finger on sensor.");
+  while (!particleSensor.begin()) {
+    Serial.println("MAX30102 not found!");
     delay(1000);
   }
 
-  // Process logic every minute
-  if (millis() - lastUpdateTimer > UPDATE_INTERVAL) {
-    processMinuteLogic();
-    lastUpdateTimer = millis();
-  }
-}
+  particleSensor.sensorConfiguration(
+    60, SAMPLEAVG_8, MODE_MULTILED, SAMPLERATE_400, PULSEWIDTH_411, ADCRANGE_16384
+  ); // <-- semicolon
 
-void processMinuteLogic() {
-  // Use last valid reading if no samples this minute
-  int averageHR = (hrSampleCount > 0) ? (hrSum / hrSampleCount) : lastValidBPM;
-  
-  Serial.println("\n--- Minute Update ---");
-  Serial.print("Average HR: ");
-  Serial.print(averageHR);
-  Serial.println(" BPM");
-
-  // Reset counters
-  hrSum = 0;
-  hrSampleCount = 0;
-
-  // Store in history for pattern analysis
-  if (averageHR > 0) {
-    hrHistory[hrHistoryIndex] = averageHR;
-    hrHistoryIndex = (hrHistoryIndex + 1) % HR_HISTORY_SIZE;
-    if (hrHistoryCount < HR_HISTORY_SIZE) hrHistoryCount++;
-  }
-
-  // Check for irregular patterns
-  checkForIrregularities(averageHR);
-
-  // Check sleep thresholds
-  if (!isSleeping && averageHR > 0 && averageHR < THRESHOLD_SLEEP_START) {
-    startSleepPeriod();
-  }
-  else if (isSleeping && averageHR > THRESHOLD_SLEEP_END) {
-    endSleepPeriod();
-  }
-  
-  Serial.print("Status: ");
-  Serial.println(isSleeping ? "SLEEPING" : "AWAKE");
-  Serial.println("--------------------\n");
-}
-
-void startSleepPeriod() {
-  isSleeping = true;
-  currentSleepStart = (float)(millis() - projectStartTime) / 3600000.0;
-  
-  Serial.println(">>> SLEEP PERIOD STARTED <<<");
-}
-
-void endSleepPeriod() {
-  isSleeping = false;
-  float endTime = (float)(millis() - projectStartTime) / 3600000.0;
-  float durationHours = endTime - currentSleepStart;
-  
-  // Store in array
-  if (sleepIndex < 50) {
-    sleepHistory[sleepIndex].startTime = currentSleepStart;
-    sleepHistory[sleepIndex].duration = durationHours * 60; // minutes
-    sleepIndex++;
-    
-    Serial.println(">>> SLEEP PERIOD ENDED <<<");
-    Serial.print("Duration: ");
-    Serial.print(durationHours * 60);
-    Serial.println(" minutes");
-  }
-}
-
-void checkForIrregularities(int currentHR) {
-  // Need at least 5 minutes of data to detect patterns
-  if (hrHistoryCount < 5) {
-    return;
-  }
-
-  bool irregularDetected = false;
-  String alertReason = "";
-
-  // 1. Check for dangerously high heart rate
-  if (currentHR > 120 && !isSleeping) {
-    irregularDetected = true;
-    alertReason = "VERY HIGH heart rate detected: " + String(currentHR) + " BPM while awake";
-  }
-  else if (currentHR > 90 && isSleeping) {
-    irregularDetected = true;
-    alertReason = "ELEVATED heart rate during sleep: " + String(currentHR) + " BPM";
-  }
-
-  // 2. Check for dangerously low heart rate
-  if (currentHR < 40 && currentHR > 0) {
-    irregularDetected = true;
-    alertReason = "CRITICALLY LOW heart rate: " + String(currentHR) + " BPM";
-  }
-
-  // 3. Check for high variability (erratic pattern)
-  // Calculate standard deviation of last 10 minutes
-  if (hrHistoryCount >= HR_HISTORY_SIZE) {
-    float mean = 0;
-    for (int i = 0; i < HR_HISTORY_SIZE; i++) {
-      mean += hrHistory[i];
-    }
-    mean /= HR_HISTORY_SIZE;
-
-    float variance = 0;
-    for (int i = 0; i < HR_HISTORY_SIZE; i++) {
-      float diff = hrHistory[i] - mean;
-      variance += diff * diff;
-    }
-    variance /= HR_HISTORY_SIZE;
-    float stdDev = sqrt(variance);
-
-    // If standard deviation is high, heart rate is very erratic
-    if (stdDev > 15.0) {
-      irregularDetected = true;
-      alertReason = "ERRATIC heart rate pattern detected (StdDev: " + String(stdDev, 1) + ")";
-    }
-  }
-
-  // 4. Check for sudden large changes (>30 BPM jump)
-  if (hrHistoryCount >= 2) {
-    int prevIndex = (hrHistoryIndex - 2 + HR_HISTORY_SIZE) % HR_HISTORY_SIZE;
-    int hrChange = abs(currentHR - hrHistory[prevIndex]);
-    
-    if (hrChange > 30) {
-      irregularDetected = true;
-      alertReason = "SUDDEN heart rate change: " + String(hrChange) + " BPM in 1 minute";
-    }
-  }
-
-  // Send alert if irregularity detected and we haven't sent one recently
-  if (irregularDetected && !lastAlertSent) {
-    sendIrregularityAlert(alertReason, currentHR);
-    lastAlertSent = true;
-  }
-  else if (!irregularDetected && lastAlertSent) {
-    // Reset alert flag when pattern normalizes
-    lastAlertSent = false;
-    Serial.println("Heart rate pattern normalized.");
-  }
-}
-
-void sendIrregularityAlert(String reason, int currentHR) {
-  Serial.println("\n\n!!! IRREGULAR PATTERN DETECTED !!!");
-  Serial.println("====================================");
-  Serial.println(reason);
-  
-  String emailBody = "⚠️ SLEEP MONITOR ALERT ⚠️\n";
-  emailBody += "===========================\n\n";
-  emailBody += "An irregular heart rate pattern has been detected:\n\n";
-  emailBody += "ALERT REASON: " + reason + "\n\n";
-  
-  emailBody += "Current Heart Rate: " + String(currentHR) + " BPM\n";
-  emailBody += "Status: " + String(isSleeping ? "SLEEPING" : "AWAKE") + "\n";
-  emailBody += "Time: " + String((millis() - projectStartTime) / 3600000.0, 2) + " hours since device start\n\n";
-  
-  // Include recent history
-  emailBody += "Recent Heart Rate History (last 10 minutes):\n";
-  emailBody += "--------------------------------------------\n";
-  for (int i = 0; i < hrHistoryCount; i++) {
-    int index = (hrHistoryIndex - hrHistoryCount + i + HR_HISTORY_SIZE) % HR_HISTORY_SIZE;
-    emailBody += "  " + String(i + 1) + " min ago: " + String(hrHistory[index]) + " BPM\n";
-  }
-  
-  emailBody += "\nRECOMMENDATION: Please check on the monitored individual.\n";
-  emailBody += "\n--- End of Alert ---\n";
-
-  // Print to Serial
-  Serial.println(emailBody);
-
-  // Send via email
-  if (WiFi.status() == WL_CONNECTED) {
-    sendEmail(emailBody, true);  // true = this is an alert
-  } else {
-    Serial.println("ERROR: WiFi disconnected. Cannot send alert.");
-    connectToWiFi();
-  }
-  
-  Serial.println("====================================\n\n");
-}
-
-void sendDailyReport() {
-  Serial.println("\n\n========================================");
-  Serial.println("     GENERATING DAILY SLEEP REPORT");
-  Serial.println("========================================\n");
-  
-  String emailBody = "DAILY SLEEP REPORT\n";
-  emailBody += "==================\n\n";
-  
-  float totalSleepTimeHours = 0;
-
-  if (sleepIndex == 0) {
-    emailBody += "No sleep periods recorded in the past 24 hours.\n\n";
-  } else {
-    emailBody += "Sleep Periods:\n";
-    emailBody += "--------------\n";
-    
-    for (int i = 0; i < sleepIndex; i++) {
-      emailBody += "Period " + String(i + 1) + ":\n";
-      emailBody += "  Start: " + String(sleepHistory[i].startTime, 2) + " hours since device start\n";
-      emailBody += "  Duration: " + String(sleepHistory[i].duration, 1) + " minutes\n\n";
-      
-      totalSleepTimeHours += (sleepHistory[i].duration / 60.0);
-    }
-  }
-
-  emailBody += "Summary:\n";
-  emailBody += "--------\n";
-  emailBody += "Total Sleep Time: " + String(totalSleepTimeHours, 2) + " hours\n\n";
-
-  emailBody += "Sleep Quality Assessment: ";
-  if (totalSleepTimeHours < 6.0) {
-    emailBody += "POOR (Less than 6 hours - Insufficient)\n";
-  } else if (totalSleepTimeHours < 8.0) {
-    emailBody += "FAIR (6-8 hours - Below recommended)\n";
-  } else if (totalSleepTimeHours <= 9.0) {
-    emailBody += "GOOD (8-9 hours - Recommended range)\n";
-  } else {
-    emailBody += "EXCESSIVE (Over 9 hours)\n";
-  }
-
-  emailBody += "\nRecommendation: Aim for 7-9 hours of sleep per night.\n";
-  emailBody += "\n--- End of Report ---\n";
-
-  // Print to Serial
-  Serial.println(emailBody);
-
-  // Send via email
-  if (WiFi.status() == WL_CONNECTED) {
-    sendEmail(emailBody);
-  } else {
-    Serial.println("ERROR: WiFi disconnected. Cannot send email.");
-    connectToWiFi();
-  }
-
-  // Clear data for next period
-  sleepIndex = 0;
-  
-  Serial.println("========================================\n\n");
-}
-
-void connectToWiFi() {
-  Serial.print("Connecting to WiFi");
-  
-  WiFi.begin(ssid, password);
-  
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi Connected!");
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("\nWiFi Connection Failed!");
-  }
-}
-
-void sendEmail(String body, bool isAlert = false) {
-  if (isAlert) {
-    Serial.println("Attempting to send ALERT email...");
-  } else {
-    Serial.println("Attempting to send email...");
-  }
-  
-  WiFiClient client;
-  
-  if (!client.connect(smtpServer, smtpPort)) {
-    Serial.println("ERROR: Could not connect to SMTP server");
-    return;
-  }
-  
-  Serial.println("Connected to SMTP server");
-  
-  // Wait for server greeting
+  Serial.println("Sleep Monitoring System Started");
   delay(1000);
-  
-  // SMTP conversation
-  client.println("HELO arduino");
-  delay(500);
-  
-  client.println("MAIL FROM: <" + String(emailSender) + ">");
-  delay(500);
-  
-  client.println("RCPT TO: <" + String(emailRecipient) + ">");
-  delay(500);
-  
-  client.println("DATA");
-  delay(500);
-  
-  // Email headers
-  client.println("From: Sleep Monitor <" + String(emailSender) + ">");
-  client.println("To: <" + String(emailRecipient) + ">");
-  
-  if (isAlert) {
-    client.println("Subject: ⚠️ URGENT: Irregular Heart Rate Alert");
-    client.println("Importance: high");
-  } else {
-    client.println("Subject: Sleep Monitor Report");
+}
+
+// ---------------- MAIN LOOP ----------------
+void loop() {
+  detectSleepPeriod();
+
+  // Send data every 24 hours to hospital
+  //need to use this condition to ensure that data delay does not skip over send 
+  if (((millis() % (1000UL * 60UL * 60UL * 24UL)) <= 5000) && millis() > 7000){
+    sendDailyReport();
+    checkSleepQuality();
   }
-  
-  client.println("Content-Type: text/plain; charset=UTF-8");
-  client.println();
-  
-  // Email body
-  client.println(body);
-  
-  // End of message
-  client.println(".");
-  delay(500);
-  
-  client.println("QUIT");
-  client.stop();
-  
-  if (isAlert) {
-    Serial.println("ALERT email sent successfully!");
-  } else {
-    Serial.println("Email sent successfully!");
+
+  delay(5000);  // check heart rate every 5 seconds
+}
+
+// ---------------- FUNCTIONS ----------------
+
+// Read heart rate using oxiometer
+int readHeartRate() {
+  particleSensor.heartrateAndOxygenSaturation();
+  Serial.print("Current heart rate: "); Serial.println(heartRate);
+  return heartRate;
+}
+
+
+// Detect when sleep starts and ends
+void detectSleepPeriod() {
+  readHeartRate();
+
+  if (heartRate < LOW_HR_THRESHOLD && !sleeping){
+    sleeping = true;
+    sleepStartTime = millis();
+    Serial.println("Starting sleep timer");
   }
+
+  //end sleep period if heart rate becomes higher than threshold
+  if (heartRate > HIGH_HR_THRESHOLD && sleeping) {
+    sleeping = false;
+    //total program running time - time when sleep period began
+    unsigned long duration = millis() - sleepStartTime;
+
+    //if sleep duration is longer than minimum time then log it
+    if (duration >= MIN_SLEEP_TIME_MS) {
+      logSleepPeriod(sleepStartTime, duration);
+      Serial.println("Sleep period logged.");
+    } else {
+      Serial.println("Sleep period too short, so not logged.");
+    }
+  }
+}
+
+// Log sleep period into memory
+void logSleepPeriod(unsigned long start, unsigned long duration) {
+  if (logCount < MAX_LOGS) {
+    logs[logCount].start = start;
+    logs[logCount].duration = duration;
+    logCount++;
+  } else {
+    Serial.println("Log memory full. Sleep period not recorded.");
+  }
+}
+
+//Send data to hospital staff
+void sendDailyReport() {
+  Serial.println("Daily Sleep Report");
+
+  String body;
+  body += "Daily Sleep Report\n";
+  body += "=============================\n";
+
+  if (logCount == 0) {
+    Serial.println("No sleep records found.");
+    body += "No sleep records found.\n";
+  } else {
+    for (int i = 0; i < logCount; i++) {
+      // hours since program start
+      float startHr = logs[i].start / 3600000.0;
+      float durMin  = logs[i].duration / 60000.0;
+
+      Serial.print("Period "); Serial.print(i + 1);
+      Serial.print(": Start="); Serial.print(startHr, 2);
+      Serial.print(" h since program execution, Duration=");
+      Serial.print(durMin, 1); Serial.println(" min");
+
+      body += "Period " + String(i + 1) +
+              ": Start=" + String(startHr, 2) +
+              " h since program execution, Duration=" +
+              String(durMin, 1) + " min\n";
+    }
+  }
+  body += "=============================\n";
+
+  String subject = "Sleep Report - UNO R4 WiFi";
+
+  bool ok = sendEmailSMTP_SSL(
+      SMTP_HOST, SMTP_PORT,
+      SMTP_USER, SMTP_PASS,
+      FROM_EMAIL, FROM_NAME,
+      TO_EMAIL,
+      subject, body
+  );
+  if (!ok) {
+    Serial.println("Failed to email daily report.");
+  }
+}
+
+
+//Check if sleep quality is good
+void checkSleepQuality() {
+  totalSleepMin = 0;
+  for (int i = 0; i < logCount; i++) {
+    totalSleepMin += logs[i].duration / 60000.0;
+  }
+
+  float totalSleepHr = totalSleepMin / 60.0;
+  if (totalSleepHr < 8.0){
+    Serial.println("Patient had poor sleep (" + String(totalSleepHr, 1) + " hrs)");
+  } else {
+    Serial.println("Sleep quality OK (" + String(totalSleepHr, 1) + " hrs)");
+  }
+}
+
+
+
+sketch_nov2a.ino
+5 KB
+
+
+// Code for Sending Board to mail
+
+WiFiSSLClient smtpClient;
+
+// Simple base64 encoder (small + synchronous)
+const char b64_tbl[] PROGMEM =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+String base64Encode(const String &in) {
+  String out;
+  int val = 0, valb = -6;
+  for (uint8_t c : in) {
+    val = (val << 8) + c;
+    valb += 8;
+    while (valb >= 0) {
+      out += (char)pgm_read_byte(&b64_tbl[(val >> valb) & 0x3F]);
+      valb -= 6;
+    }
+  }
+  if (valb > -6) out += (char)pgm_read_byte(&b64_tbl[((val << 8) >> (valb + 8)) & 0x3F]);
+  while (out.length() % 4) out += '=';
+  return out;
+}
+
+bool readLineUntil(WiFiSSLClient &c, String &line, uint32_t timeoutMs = 10000) {
+  line = "";
+  uint32_t t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    while (c.available()) {
+      char ch = (char)c.read();
+      line += ch;
+      if (line.endsWith("\r\n")) return true;
+    }
+    delay(1);
+  }
+  return false;
+}
+
+bool expectCode(WiFiSSLClient &c, const char* expected3Digits, uint32_t timeoutMs = 10000) {
+  String line;
+  bool gotAny = false;
+  String last;
+  // SMTP multi-line responses end with a line starting with "XYZ " (space, not hyphen)
+  while (readLineUntil(c, line, timeoutMs)) {
+    // Serial.print("S: "); Serial.print(line);  // enable for debug
+    last = line;
+    gotAny = true;
+    if (line.length() >= 4 && isDigit(line[0]) && isDigit(line[1]) && isDigit(line[2])) {
+      if (line[3] == ' ') break; // last line of a multiline reply
+    }
+  }
+  if (!gotAny) return false;
+  return last.startsWith(expected3Digits);
+}
+
+bool smtpWrite(WiFiSSLClient &c, const String &cmd) {
+  // Serial.print("C: "); Serial.print(cmd);     // enable for debug
+  return c.print(cmd) == (int)cmd.length();
+}
+
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  Serial.print("Connecting to WiFi: "); Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+    delay(250);
+    Serial.print('.');
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi connected. IP: "); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi connect FAILED");
+  }
+}
+
+// Sends a simple text email over implicit SSL (port 465) using AUTH LOGIN.
+// subject/body: plain text (use \n for newlines).
+bool sendEmailSMTP_SSL(const char* host,
+                       uint16_t port,
+                       const char* user,
+                       const char* pass,
+                       const char* fromEmail,
+                       const char* fromName,
+                       const char* toEmail,
+                       const String& subject,
+                       const String& body)
+{
+  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Email aborted: no WiFi.");
+    return false;
+  }
+
+  Serial.print("Connecting to SMTP: "); Serial.print(host); Serial.print(':'); Serial.println(port);
+  if (!smtpClient.connect(host, port)) {
+    Serial.println("TLS connect failed.");
+    return false;
+  }
+
+  // 220
+  if (!expectCode(smtpClient, "220")) { Serial.println("No 220 greeting."); goto FAIL; }
+
+  // EHLO
+  smtpWrite(smtpClient, "EHLO uno-r4\r\n");
+  if (!expectCode(smtpClient, "250")) { Serial.println("EHLO failed."); goto FAIL; }
+
+  // AUTH LOGIN
+  smtpWrite(smtpClient, "AUTH LOGIN\r\n");
+  if (!expectCode(smtpClient, "334")) { Serial.println("AUTH LOGIN not accepted."); goto FAIL; }
+
+  // Username (base64)
+  smtpWrite(smtpClient, base64Encode(user) + "\r\n");
+  if (!expectCode(smtpClient, "334")) { Serial.println("Username rejected."); goto FAIL; }
+
+  // Password (base64)
+  smtpWrite(smtpClient, base64Encode(pass) + "\r\n");
+  if (!expectCode(smtpClient, "235")) { Serial.println("Password rejected."); goto FAIL; }
+
+  // MAIL FROM
+  smtpWrite(smtpClient, "MAIL FROM:<" + String(fromEmail) + ">\r\n");
+  if (!expectCode(smtpClient, "250")) { Serial.println("MAIL FROM failed."); goto FAIL; }
+
+  // RCPT TO
+  smtpWrite(smtpClient, "RCPT TO:<" + String(toEmail) + ">\r\n");
+  if (!expectCode(smtpClient, "250")) { Serial.println("RCPT TO failed."); goto FAIL; }
+
+  // DATA
+  smtpWrite(smtpClient, "DATA\r\n");
+  if (!expectCode(smtpClient, "354")) { Serial.println("DATA not accepted."); goto FAIL; }
+
+  // Headers + body (minimal)
+  String msg;
+  msg  = "From: " + String(fromName) + " <" + String(fromEmail) + ">\r\n";
+  msg += "To: <" + String(toEmail) + ">\r\n";
+  msg += "Subject: " + subject + "\r\n";
+  msg += "MIME-Version: 1.0\r\n";
+  msg += "Content-Type: text/plain; charset=utf-8\r\n";
+  msg += "Content-Transfer-Encoding: 7bit\r\n";
+  msg += "\r\n";
+  msg += body;
+  msg += "\r\n.\r\n";   // end of DATA
+
+  if (!smtpWrite(smtpClient, msg)) { Serial.println("Write message failed."); goto FAIL; }
+  if (!expectCode(smtpClient, "250")) { Serial.println("Server rejected DATA."); goto FAIL; }
+
+  // QUIT
+  smtpWrite(smtpClient, "QUIT\r\n");
+  expectCode(smtpClient, "221"); // optional check
+
+  smtpClient.stop();
+  Serial.println("Email sent OK.");
+  return true;
+
+FAIL:
+  smtpClient.stop();
+  Serial.println("Email send FAILED.");
+  return false;
 }
